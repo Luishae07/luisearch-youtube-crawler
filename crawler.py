@@ -69,30 +69,62 @@ def all_queries():
     return qs
 
 
-def extract_yt_initial_data(html):
-    marker = 'var ytInitialData = '
-    start = html.find(marker)
-    if start == -1:
-        return None
-    start += len(marker)
-    end = html.find(';</script>', start)
-    if end == -1:
-        return None
-    try:
-        return json.loads(html[start:end])
-    except Exception:
-        return None
+def _matching_brace(s, open_pos):
+    """Given the index of a '{' in s, returns the index just past its
+    matching '}', properly skipping over string literals (so braces inside
+    a title/description don't throw off the count)."""
+    depth = 0
+    i = open_pos
+    in_string = False
+    escape = False
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif c == '\\':
+                escape = True
+            elif c == '"':
+                in_string = False
+        else:
+            if c == '"':
+                in_string = True
+            elif c == '{':
+                depth += 1
+            elif c == '}':
+                depth -= 1
+                if depth == 0:
+                    return i + 1
+        i += 1
+    return -1
 
 
-def find_video_renderers(value, out):
-    if isinstance(value, dict):
-        if 'videoRenderer' in value:
-            out.append(value['videoRenderer'])
-        for v in value.values():
-            find_video_renderers(v, out)
-    elif isinstance(value, list):
-        for v in value:
-            find_video_renderers(v, out)
+def find_video_renderers(html):
+    """Scans the raw page text for each `"videoRenderer":{...}` fragment and
+    json.loads *only* that fragment, instead of parsing (and then
+    recursively walking) the entire ytInitialData blob -- that blob is
+    mostly unrelated UI config and can be 500KB+, so this skips the vast
+    majority of the page's JSON entirely."""
+    out = []
+    marker = '"videoRenderer":'
+    pos = 0
+    while True:
+        idx = html.find(marker, pos)
+        if idx == -1:
+            break
+        brace = html.find('{', idx)
+        if brace == -1:
+            break
+        end = _matching_brace(html, brace)
+        if end == -1:
+            break
+        try:
+            out.append(json.loads(html[brace:end]))
+        except Exception:
+            pass
+        pos = end
+    return out
 
 
 def text_from_runs(v):
@@ -142,12 +174,10 @@ def search_youtube(query):
     except Exception as e:
         print(f'fetch failed for {query!r}: {e}', flush=True)
         return []
-    data = extract_yt_initial_data(html)
-    if data is None:
-        print(f'no ytInitialData for {query!r} (page shape changed, or blocked)', flush=True)
+    renderers = find_video_renderers(html)
+    if not renderers:
+        print(f'no videoRenderer fragments for {query!r} (page shape changed, or blocked)', flush=True)
         return []
-    renderers = []
-    find_video_renderers(data, renderers)
     videos = [parse_video_renderer(vr) for vr in renderers]
     return [v for v in videos if v]
 
