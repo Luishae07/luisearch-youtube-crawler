@@ -22,6 +22,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
 INGEST_URL = os.environ.get('INGEST_URL', '')
 INGEST_TOKEN = os.environ.get('INGEST_TOKEN', '')
@@ -186,17 +187,37 @@ def crawl_forever():
                 False, None, False, None, None, {})
             jar.cookiejar.set_cookie(c)
 
+    # Concurrency instead of one query at a time -- the bottleneck here is
+    # network round-trip latency, not CPU, so N workers genuinely crawl ~N
+    # times faster on a single small instance. 6 is a moderate number: fast
+    # enough to matter, not so many that Render's free-tier CPU share or
+    # YouTube's per-IP rate limit gets hit.
     batch = []
-    for query in itertools.cycle(all_queries()):
+    batch_lock = threading.Lock()
+
+    def worker(query):
         results = search_youtube(query)
         print(f'{query!r}: {len(results)} videos', flush=True)
-        batch.extend(results)
-        if len(batch) >= 100:
-            ingest_batch(batch)
-            batch = []
-        # A search-results page fetch, not an API call -- pace it so we
-        # don't get this instance's IP rate-limited or CAPTCHA'd.
-        time.sleep(2.5)
+        with batch_lock:
+            batch.extend(results)
+            if len(batch) >= 100:
+                to_send, batch[:] = batch[:], []
+                ingest_batch(to_send)
+
+    # Executor.map() eagerly consumes its whole iterable up front (it builds
+    # the full task list before returning anything) -- with an infinite
+    # itertools.cycle() that hangs forever before doing any real work. Keep
+    # a bounded rolling window of in-flight futures instead, topping it back
+    # up to WORKERS every time one finishes.
+    WORKERS = 6
+    query_iter = itertools.cycle(all_queries())
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        in_flight = {pool.submit(worker, next(query_iter)) for _ in range(WORKERS)}
+        while True:
+            done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
+            for fut in done:
+                fut.result()  # surface any worker exception instead of swallowing it
+                in_flight.add(pool.submit(worker, next(query_iter)))
 
 
 class HealthHandler(http.server.BaseHTTPRequestHandler):
