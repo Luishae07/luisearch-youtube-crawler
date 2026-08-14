@@ -209,7 +209,7 @@ def crawl_forever():
     # itertools.cycle() that hangs forever before doing any real work. Keep
     # a bounded rolling window of in-flight futures instead, topping it back
     # up to WORKERS every time one finishes.
-    WORKERS = 6
+    WORKERS = 50
     query_iter = itertools.cycle(all_queries())
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
         in_flight = {pool.submit(worker, next(query_iter)) for _ in range(WORKERS)}
